@@ -39,6 +39,10 @@ static unsigned int max_file_sectors = 4;
 module_param(max_file_sectors, uint, 0444);
 MODULE_PARM_DESC(max_file_sectors, "Максимальный размер файла в секторах (M)");
 
+static unsigned int do_format = 0;
+module_param(do_format, uint, 0444);
+MODULE_PARM_DESC(do_format, "Разрешить форматирование при отсутствии SB (0=нет, 1=да)");
+
 // Структура информации о суперблоке в памяти (хранится в sb->s_fs_info)
 struct cwfs_sb_info {
     uint32_t file_count;         // Количество файлов
@@ -333,6 +337,14 @@ static ssize_t cwfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
             return ret ? ret : -EFAULT;
         }
 
+        // В последней итерации обнуляем остаток сектора после записанных байт,
+        // чтобы не оставалось мусора от предыдущей более длинной записи
+        if (count == to_write) {
+            size_t tail = CWFS_SECTOR_SIZE - offset_in_sector - to_write;
+            if (tail > 0)
+                memset(bh->b_data + offset_in_sector + to_write, 0, tail);
+        }
+
         // Помечаем грязным и при необходимости синхронизируем
         mark_buffer_dirty(bh);
         if (iocb->ki_flags & IOCB_DSYNC)
@@ -345,6 +357,10 @@ static ssize_t cwfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
     }
 
     iocb->ki_pos = pos;
+
+    // Сбрасываем page cache, чтобы следующий read не вернул устаревшие данные
+    invalidate_mapping_pages(inode->i_mapping, 0, -1);
+
     return ret;
 }
 
@@ -416,6 +432,10 @@ static long cwfs_file_ioctl(struct file *filp, unsigned int cmd, unsigned long a
         mark_buffer_dirty(bh);
         sync_dirty_buffer(bh);
         brelse(bh);
+
+        // Сбрасываем in-memory состояние и VFS-кеш
+        sbi->file_count = 0;
+        shrink_dcache_sb(sb);
 
         pr_info("curse_work: ФС стёрта\n");
         break;
@@ -587,8 +607,14 @@ static int cwfs_fill_super(struct super_block *sb, struct fs_context *fc)
         pr_info("curse_work: загружена ФС: %u файлов по %u секторов\n",
                 sbi->file_count, sbi->file_size_sectors);
     } else {
-        // Форматирование: создаём новую ФС
+        // Суперблок не найден — форматирование только если явно разрешено
         uint32_t data_start;
+
+        if (!do_format) {
+            pr_err("curse_work: валидный суперблок не найден, монтирование невозможно (используйте do_format=1 для форматирования)\n");
+            kfree(sbi);
+            return -EUCLEAN;
+        }
 
         pr_info("curse_work: суперблок не найден — форматирование\n");
 
